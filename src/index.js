@@ -66,6 +66,15 @@ const vamsysApiScope = String(
 const liveFeedChannelId =
   process.env.LIVE_FEED_CHANNEL_ID || '1456988328388985003';
 const liveFeedIntervalMs = Number(process.env.LIVE_FEED_INTERVAL_MS || 120000);
+const caucasusWebBaseUrl = String(process.env.CAUCASUS_WEB_URL || 'https://vatcaucasus.com')
+  .trim()
+  .replace(/\/+$/, '');
+const caucasusFeedChannelId = String(process.env.CAUCASUS_FEED_CHANNEL_ID || '').trim();
+const caucasusFeedIntervalMs = Number(process.env.CAUCASUS_FEED_INTERVAL_MS || 120000);
+const caucasusAtcPrefixes = String(process.env.CAUCASUS_ATC_PREFIXES || 'UG,UD,UR,UB')
+  .split(/[\s,;]+/)
+  .map((p) => p.trim().toUpperCase())
+  .filter(Boolean);
 const pirepReviewChannelId =
   process.env.PIREP_REVIEW_CHANNEL_ID || '1405161495368699914';
 const pirepReviewIntervalMs = Number(process.env.PIREP_REVIEW_INTERVAL_MS || 60000);
@@ -153,6 +162,8 @@ let fleetCatalogCache = {
 
 let liveFeedMessageId = null;
 let liveFeedTimer = null;
+let caucasusFeedMessageId = null;
+let caucasusFeedTimer = null;
 let remoteConfigTimer = null;
 let syncedAdminRoleIds = [...fallbackAdminRoleIds];
 let cachedTicketCategories = null;
@@ -3535,6 +3546,139 @@ async function upsertLiveFlightsFeedMessage() {
   }
 }
 
+function isCaucasusCallsign(callsign = '') {
+  const upper = String(callsign).toUpperCase();
+  return caucasusAtcPrefixes.some((prefix) => upper.startsWith(prefix));
+}
+
+function formatAtcSuffix(callsign = '') {
+  const suffix = String(callsign).split('_').pop() || '';
+  const labels = { DEL: 'Delivery', GND: 'Ground', TWR: 'Tower', APP: 'Approach', DEP: 'Departure', CTR: 'Center', FSS: 'FSS', ATIS: 'ATIS', OBS: 'Observer' };
+  return labels[suffix.toUpperCase()] || suffix;
+}
+
+function formatDiscordTimestamp(dateStr, style = 't') {
+  const ts = Math.floor(new Date(dateStr).getTime() / 1000);
+  return isNaN(ts) ? String(dateStr) : `<t:${ts}:${style}>`;
+}
+
+async function fetchCaucasusLive() {
+  const res = await fetch(`${caucasusWebBaseUrl}/api/live`, {
+    headers: { 'User-Agent': 'NWSBot/1.0' },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`/api/live returned ${res.status}`);
+  return res.json();
+}
+
+async function fetchCaucasusBookings() {
+  const res = await fetch(`${caucasusWebBaseUrl}/api/live/bookings`, {
+    headers: { 'User-Agent': 'NWSBot/1.0' },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`/api/live/bookings returned ${res.status}`);
+  return res.json();
+}
+
+function buildCaucasusAtcEmbed(liveData, bookings) {
+  const controllers = Array.isArray(liveData?.controllers)
+    ? liveData.controllers.filter((c) => isCaucasusCallsign(c.callsign))
+    : [];
+
+  const now = Date.now();
+  const in24h = now + 24 * 60 * 60 * 1000;
+
+  const upcoming = Array.isArray(bookings)
+    ? bookings
+        .filter((b) => {
+          if (!isCaucasusCallsign(b.callsign)) return false;
+          const start = new Date(b.start).getTime();
+          const end = new Date(b.end).getTime();
+          return end > now && start < in24h;
+        })
+        .sort((a, b) => new Date(a.start) - new Date(b.start))
+    : [];
+
+  const embed = new EmbedBuilder()
+    .setColor(0x1d4ed8)
+    .setTitle('🗺️ Caucasus ACC — ATC Status')
+    .setTimestamp(new Date());
+
+  if (controllers.length === 0) {
+    embed.addFields({ name: '🟢 Online', value: 'No controllers online', inline: false });
+  } else {
+    const lines = controllers.map((c) => {
+      const type = formatAtcSuffix(c.callsign);
+      const online = c.time_online ? ` · ${c.time_online}` : '';
+      return `**${c.callsign}** (${type}) — ${c.name || 'Unknown'}${online} \`${c.frequency || '---'}\``;
+    });
+    embed.addFields({
+      name: `🟢 Online (${controllers.length})`,
+      value: lines.join('\n').slice(0, 1024),
+      inline: false,
+    });
+  }
+
+  if (upcoming.length === 0) {
+    embed.addFields({ name: '📅 Upcoming Bookings (24h)', value: 'No bookings', inline: false });
+  } else {
+    const lines = upcoming.slice(0, 15).map((b) => {
+      const isActive = new Date(b.start).getTime() <= now;
+      const status = isActive ? '🔴' : '🕐';
+      return `${status} **${b.callsign}** — ${b.name || '?'} · ${formatDiscordTimestamp(b.start, 't')}–${formatDiscordTimestamp(b.end, 't')}`;
+    });
+    embed.addFields({
+      name: `📅 Bookings (${upcoming.length})`,
+      value: lines.join('\n').slice(0, 1024),
+      inline: false,
+    });
+  }
+
+  embed.setFooter({ text: `Updated · vatcaucasus.com` });
+  return embed;
+}
+
+async function upsertCaucasusAtcFeedMessage() {
+  if (!caucasusFeedChannelId) return;
+
+  try {
+    const channel = await client.channels.fetch(caucasusFeedChannelId);
+    if (!channel?.isTextBased()) return;
+
+    const [liveData, bookings] = await Promise.all([
+      fetchCaucasusLive().catch(() => null),
+      fetchCaucasusBookings().catch(() => []),
+    ]);
+
+    if (!liveData && !bookings?.length) return;
+
+    const embed = buildCaucasusAtcEmbed(liveData || {}, bookings || []);
+
+    if (!caucasusFeedMessageId) {
+      try {
+        const recent = await channel.messages.fetch({ limit: 30 });
+        const existing = recent.find((m) => m.author.id === client.user?.id && m.embeds?.[0]?.title?.includes('Caucasus ACC'));
+        if (existing?.id) caucasusFeedMessageId = existing.id;
+      } catch {}
+    }
+
+    if (caucasusFeedMessageId) {
+      try {
+        const msg = await channel.messages.fetch(caucasusFeedMessageId);
+        await msg.edit({ embeds: [embed] });
+        return;
+      } catch {
+        caucasusFeedMessageId = null;
+      }
+    }
+
+    const sent = await channel.send({ embeds: [embed] });
+    caucasusFeedMessageId = sent.id;
+  } catch (error) {
+    console.error('Caucasus feed update failed:', error?.message || error);
+  }
+}
+
 function detectVac(callsign = '') {
   const raw = String(callsign).toUpperCase();
   if (raw.includes('KAR')) return 'KAR';
@@ -4079,6 +4223,12 @@ client.once('clientReady', () => {
     clearInterval(liveFeedTimer);
   }
   liveFeedTimer = setInterval(upsertLiveFlightsFeedMessage, liveFeedIntervalMs);
+
+  if (caucasusFeedChannelId) {
+    upsertCaucasusAtcFeedMessage();
+    if (caucasusFeedTimer) clearInterval(caucasusFeedTimer);
+    caucasusFeedTimer = setInterval(upsertCaucasusAtcFeedMessage, caucasusFeedIntervalMs);
+  }
 
   notifyPirepReviewStatus();
   if (pirepReviewTimer) {
@@ -6373,6 +6523,9 @@ process.on('SIGINT', async () => {
   if (liveFeedTimer) {
     clearInterval(liveFeedTimer);
   }
+  if (caucasusFeedTimer) {
+    clearInterval(caucasusFeedTimer);
+  }
   if (notamNotificationTimer) {
     clearInterval(notamNotificationTimer);
   }
@@ -6390,6 +6543,9 @@ process.on('SIGTERM', async () => {
   }
   if (liveFeedTimer) {
     clearInterval(liveFeedTimer);
+  }
+  if (caucasusFeedTimer) {
+    clearInterval(caucasusFeedTimer);
   }
   if (notamNotificationTimer) {
     clearInterval(notamNotificationTimer);
