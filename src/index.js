@@ -23,6 +23,7 @@ import {
   TextInputBuilder,
   TextInputStyle,
   ChannelType,
+  ThreadAutoArchiveDuration,
 } from 'discord.js';
 
 const execFileAsync = promisify(execFile);
@@ -104,6 +105,10 @@ const TICKET_OPEN_BUTTON_ID = 'ticket:open';
 const TICKET_CLOSE_BUTTON_ID = 'ticket:close';
 const TICKET_CREATE_MODAL_ID = 'ticket:create';
 const TICKET_CLOSE_MODAL_PREFIX = 'ticket:close:';
+const TICKET_CATEGORY_BUTTON_PREFIX = 'ticket:cat:';
+const TICKET_SUBMIT_MODAL_PREFIX = 'ticket:submit:';
+const TICKET_CLOSE_THREAD_BUTTON_PREFIX = 'ticket:close:thread:';
+const TICKET_CLOSE_THREAD_MODAL_PREFIX = 'ticket:close:modal:thread:';
 const BOOKING_VIEW_PREFIX = 'booking:view:';
 const BOOKING_CANCEL_PREFIX = 'booking:cancel:';
 const BOOKING_MENU_PREFIX = 'booking:menu:';
@@ -150,6 +155,8 @@ let liveFeedMessageId = null;
 let liveFeedTimer = null;
 let remoteConfigTimer = null;
 let syncedAdminRoleIds = [...fallbackAdminRoleIds];
+let cachedTicketCategories = null;
+let cachedTicketPanelSettings = null;
 let pilotStatusTimer = null;
 let pirepReviewTimer = null;
 let pirepReviewInitialized = false;
@@ -2293,6 +2300,61 @@ function getEffectiveAdminRoleIds() {
     : fallbackAdminRoleIds;
 }
 
+function getCachedTicketCategories() {
+  return cachedTicketCategories;
+}
+
+function getCachedTicketPanelSettings() {
+  return cachedTicketPanelSettings;
+}
+
+function getDefaultTicketCategories() {
+  return [
+    {
+      id: 'general',
+      name: 'Общие вопросы',
+      emoji: '🎫',
+      buttonStyle: 1,
+      enabled: true,
+      roleIds: [],
+      modalFields: [
+        { id: 'subject', label: 'Тема обращения', required: true, style: 1 },
+        { id: 'description', label: 'Описание', required: true, style: 2 },
+      ],
+    },
+    {
+      id: 'operations',
+      name: 'Полёты / Маршруты',
+      emoji: '✈️',
+      buttonStyle: 3,
+      enabled: true,
+      roleIds: [],
+      modalFields: [
+        { id: 'subject', label: 'Тема', required: true, style: 1 },
+        { id: 'description', label: 'Описание', required: true, style: 2 },
+      ],
+    },
+    {
+      id: 'other',
+      name: 'Другое',
+      emoji: '💬',
+      buttonStyle: 2,
+      enabled: true,
+      roleIds: [],
+      modalFields: [
+        { id: 'subject', label: 'Тема', required: true, style: 1 },
+        { id: 'description', label: 'Описание', required: true, style: 2 },
+      ],
+    },
+  ];
+}
+
+function getActiveTicketCategories() {
+  const cached = getCachedTicketCategories();
+  const categories = (Array.isArray(cached) && cached.length > 0) ? cached : getDefaultTicketCategories();
+  return categories.filter((c) => c.enabled !== false);
+}
+
 async function refreshRemoteBotConfig() {
   const botToken = String(process.env.DISCORD_BOT_CONFIG_TOKEN || '').trim();
   if (!botToken) {
@@ -2317,6 +2379,14 @@ async function refreshRemoteBotConfig() {
     : [];
 
   syncedAdminRoleIds = configuredAdminRoleIds.length > 0 ? configuredAdminRoleIds : [...fallbackAdminRoleIds];
+
+  if (Array.isArray(payload?.ticketConfig?.categories)) {
+    cachedTicketCategories = payload.ticketConfig.categories;
+  }
+  if (payload?.botSettings?.ticketPanel && typeof payload.botSettings.ticketPanel === 'object') {
+    cachedTicketPanelSettings = payload.botSettings.ticketPanel;
+  }
+
   return payload;
 }
 
@@ -2381,6 +2451,20 @@ async function updateWebsiteTicketStatusFromDiscord(ticketId, status, actorName,
   }
 
   return response.json().catch(() => ({}));
+}
+
+async function setWebsiteTicketThread(ticketId, threadId) {
+  const botToken = String(process.env.DISCORD_BOT_CONFIG_TOKEN || '').trim();
+  if (!botToken || !ticketId || !threadId) return null;
+  const response = await fetch(
+    `${websiteBaseUrl}/api/discord-bot/tickets/${encodeURIComponent(ticketId)}/thread`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Discord-Bot-Token': botToken },
+      body: JSON.stringify({ threadId }),
+    }
+  );
+  return response.ok ? response.json().catch(() => ({})) : null;
 }
 
 function buildAlertPublishEmbed({ title, summary, content, authorTag }) {
@@ -4070,6 +4154,159 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    if (interaction.customId.startsWith(TICKET_SUBMIT_MODAL_PREFIX)) {
+      if (!interaction.inGuild() || !interaction.guild) {
+        await interaction.reply({ content: 'Tickets are only available inside a server.', ephemeral: true });
+        return;
+      }
+
+      const categoryId = interaction.customId.slice(TICKET_SUBMIT_MODAL_PREFIX.length);
+      const categories = getActiveTicketCategories();
+      const category = categories.find((c) => c.id === categoryId);
+
+      const fields = category?.modalFields?.length > 0
+        ? category.modalFields
+        : [{ id: 'subject', label: 'Тема', style: 1 }, { id: 'description', label: 'Описание', style: 2 }];
+
+      const fieldValues = {};
+      for (const field of fields) {
+        try {
+          fieldValues[field.id] = interaction.fields.getTextInputValue(field.id).trim();
+        } catch {
+          fieldValues[field.id] = '';
+        }
+      }
+
+      const subject = fieldValues['subject'] || fieldValues[fields[0]?.id] || 'Support Request';
+      const description = fieldValues['description'] || fieldValues[fields[1]?.id] || '';
+      const guild = interaction.guild;
+
+      const panelSettings = getCachedTicketPanelSettings();
+      const threadChannelId =
+        category?.threadChannelId || panelSettings?.threadChannelId || '';
+
+      if (!threadChannelId) {
+        await interaction.reply({
+          content: 'Thread channel is not configured. Please contact an admin.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      try {
+        const parentChannel = await guild.channels.fetch(threadChannelId).catch(() => null);
+        if (!parentChannel?.isTextBased()) {
+          await interaction.reply({
+            content: 'Ticket channel not found or inaccessible.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        let websiteTicket = null;
+        let syncWarning = '';
+        try {
+          websiteTicket = await createWebsiteTicketFromDiscord({
+            interaction,
+            subject,
+            category: categoryId,
+            language: 'ru',
+            content: description,
+            channel: parentChannel,
+          });
+        } catch (err) {
+          syncWarning = ` (сайт не синхронизирован: ${err?.message || 'ошибка'})`;
+        }
+
+        const ticketLabel = websiteTicket?.number
+          ? `Тикет #${websiteTicket.number}`
+          : `Тикет`;
+        const threadName = `${ticketLabel} — ${subject}`.slice(0, 100);
+
+        const thread = await parentChannel.threads.create({
+          name: threadName,
+          type: ChannelType.PrivateThread,
+          autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
+          invitable: false,
+        });
+
+        await thread.members.add(interaction.user.id);
+
+        const roleIds = Array.isArray(category?.roleIds) && category.roleIds.length > 0
+          ? category.roleIds
+          : getEffectiveAdminRoleIds();
+
+        const mentionStr = roleIds.map((id) => `<@&${id}>`).join(' ');
+
+        const ticketEmbed = new EmbedBuilder()
+          .setColor(category?.color ? parseInt(String(category.color).replace('#', ''), 16) : 0x2563eb)
+          .setTitle(`${category?.emoji || '🎫'} ${subject}`)
+          .setDescription(description || 'Нет описания.')
+          .addFields(
+            { name: 'Пилот', value: `<@${interaction.user.id}>`, inline: true },
+            { name: 'Категория', value: category?.name || categoryId, inline: true },
+          );
+
+        if (websiteTicket?.number) {
+          ticketEmbed.addFields({ name: 'Номер тикета', value: `#${websiteTicket.number}`, inline: true });
+        }
+
+        for (const field of fields) {
+          if (field.id !== 'subject' && field.id !== 'description' && fieldValues[field.id]) {
+            ticketEmbed.addFields({ name: field.label || field.id, value: fieldValues[field.id], inline: false });
+          }
+        }
+
+        ticketEmbed.setTimestamp(new Date());
+
+        const closeButton = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`${TICKET_CLOSE_THREAD_BUTTON_PREFIX}${websiteTicket?.id || 'unknown'}`)
+            .setLabel('Закрыть тикет')
+            .setStyle(ButtonStyle.Danger)
+        );
+
+        await thread.send({
+          content: `<@${interaction.user.id}> ${mentionStr}`.trim(),
+          embeds: [ticketEmbed],
+          components: [closeButton],
+        });
+
+        if (websiteTicket?.id) {
+          setWebsiteTicketThread(websiteTicket.id, thread.id).catch(() => null);
+        }
+
+        if (ticketLogChannelId) {
+          const logChannel = await guild.channels.fetch(ticketLogChannelId).catch(() => null);
+          if (logChannel?.isTextBased()) {
+            await logChannel.send({
+              embeds: [
+                new EmbedBuilder()
+                  .setColor(0x16a34a)
+                  .setTitle('Тикет создан')
+                  .setDescription(`<@${interaction.user.id}> открыл ${thread}`)
+                  .addFields({ name: 'Категория', value: category?.name || categoryId, inline: true })
+                  .setTimestamp(new Date()),
+              ],
+            });
+          }
+        }
+
+        await interaction.editReply({
+          content: `✅ ${ticketLabel} создан: ${thread}.${syncWarning}`,
+        });
+      } catch (err) {
+        const replyFn = interaction.deferred ? interaction.editReply.bind(interaction) : interaction.reply.bind(interaction);
+        await replyFn({
+          content: `Не удалось создать тикет: ${err?.message || 'неизвестная ошибка'}`,
+          ephemeral: true,
+        }).catch(() => null);
+      }
+      return;
+    }
+
     if (interaction.customId === TICKET_CREATE_MODAL_ID) {
       if (!interaction.inGuild() || !interaction.guild) {
         await interaction.reply({
@@ -4243,6 +4480,62 @@ client.on('interactionCreate', async (interaction) => {
           content: 'Failed to create ticket. Check bot permissions for channels/overwrites.',
           ephemeral: true,
         });
+      }
+      return;
+    }
+
+    if (interaction.customId.startsWith(TICKET_CLOSE_THREAD_MODAL_PREFIX)) {
+      const websiteTicketId = interaction.customId.slice(TICKET_CLOSE_THREAD_MODAL_PREFIX.length);
+      const reason = interaction.fields.getTextInputValue('ticket-close-reason').trim();
+      const thread = interaction.channel;
+
+      const isOwner = thread?.ownerId === interaction.user.id;
+      if (!hasAdminAccess(interaction) && !isOwner) {
+        await interaction.reply({ content: 'У вас нет прав закрыть этот тикет.', ephemeral: true });
+        return;
+      }
+
+      try {
+        const closedEmbed = new EmbedBuilder()
+          .setColor(0x6b7280)
+          .setTitle('✅ Тикет закрыт')
+          .setDescription(reason || 'Причина не указана.')
+          .addFields({ name: 'Закрыл', value: `<@${interaction.user.id}>`, inline: true })
+          .setTimestamp(new Date());
+
+        await thread.send({ embeds: [closedEmbed] });
+
+        if (websiteTicketId && websiteTicketId !== 'unknown') {
+          await updateWebsiteTicketStatusFromDiscord(
+            websiteTicketId,
+            'closed',
+            interaction.user.globalName || interaction.user.username,
+            reason
+          ).catch(() => null);
+        }
+
+        await thread.setArchived(true, 'Ticket closed').catch(() => null);
+        await thread.setLocked(true, 'Ticket closed').catch(() => null);
+
+        if (ticketLogChannelId) {
+          const logChannel = await interaction.guild?.channels.fetch(ticketLogChannelId).catch(() => null);
+          if (logChannel?.isTextBased()) {
+            await logChannel.send({
+              embeds: [
+                new EmbedBuilder()
+                  .setColor(0xef4444)
+                  .setTitle('Тикет закрыт')
+                  .setDescription(`${thread} закрыт пользователем <@${interaction.user.id}>`)
+                  .addFields({ name: 'Причина', value: reason || 'Не указана.' })
+                  .setTimestamp(new Date()),
+              ],
+            });
+          }
+        }
+
+        await interaction.reply({ content: 'Тикет закрыт.', ephemeral: true });
+      } catch {
+        await interaction.reply({ content: 'Не удалось закрыть тикет.', ephemeral: true });
       }
       return;
     }
@@ -4903,6 +5196,72 @@ client.on('interactionCreate', async (interaction) => {
           ephemeral: true,
         });
       }
+      return;
+    }
+
+    if (interaction.customId.startsWith(TICKET_CLOSE_THREAD_BUTTON_PREFIX)) {
+      const websiteTicketId = interaction.customId.slice(TICKET_CLOSE_THREAD_BUTTON_PREFIX.length);
+      const thread = interaction.channel;
+      const isOwner = thread?.ownerId === interaction.user.id;
+
+      if (!hasAdminAccess(interaction) && !isOwner) {
+        await interaction.reply({ content: 'У вас нет прав закрыть этот тикет.', ephemeral: true });
+        return;
+      }
+
+      const modal = new ModalBuilder()
+        .setCustomId(`${TICKET_CLOSE_THREAD_MODAL_PREFIX}${websiteTicketId}`)
+        .setTitle('Закрыть тикет');
+
+      const reasonInput = new TextInputBuilder()
+        .setCustomId('ticket-close-reason')
+        .setLabel('Причина закрытия (необязательно)')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(false)
+        .setMaxLength(500);
+
+      modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.customId.startsWith(TICKET_CATEGORY_BUTTON_PREFIX)) {
+      const categoryId = interaction.customId.slice(TICKET_CATEGORY_BUTTON_PREFIX.length);
+      const categories = getActiveTicketCategories();
+      const category = categories.find((c) => c.id === categoryId);
+
+      if (!category) {
+        await interaction.reply({ content: 'Категория не найдена. Попробуйте позже.', ephemeral: true });
+        return;
+      }
+
+      const fields = Array.isArray(category.modalFields) && category.modalFields.length > 0
+        ? category.modalFields.slice(0, 5)
+        : [
+            { id: 'subject', label: 'Тема обращения', required: true, style: 1 },
+            { id: 'description', label: 'Описание', required: true, style: 2 },
+          ];
+
+      const modal = new ModalBuilder()
+        .setCustomId(`${TICKET_SUBMIT_MODAL_PREFIX}${categoryId}`)
+        .setTitle(`${category.emoji || '🎫'} ${category.name}`);
+
+      for (const field of fields) {
+        const input = new TextInputBuilder()
+          .setCustomId(field.id)
+          .setLabel((field.label || field.id).slice(0, 45))
+          .setStyle(field.style === 2 ? TextInputStyle.Paragraph : TextInputStyle.Short)
+          .setRequired(field.required !== false)
+          .setMaxLength(field.style === 2 ? 1000 : 100);
+
+        if (field.placeholder) {
+          input.setPlaceholder(String(field.placeholder).slice(0, 100));
+        }
+
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+      }
+
+      await interaction.showModal(modal);
       return;
     }
 
@@ -5775,7 +6134,7 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.commandName === 'ticket-panel') {
     if (!hasAdminAccess(interaction)) {
       await interaction.reply({
-        content: 'You do not have permission to create ticket panel.',
+        content: 'У вас нет прав для публикации панели тикетов.',
         ephemeral: true,
       });
       return;
@@ -5784,62 +6143,56 @@ client.on('interactionCreate', async (interaction) => {
     const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
     if (!targetChannel || !targetChannel.isTextBased()) {
       await interaction.reply({
-        content: 'Cannot post ticket panel to this channel.',
+        content: 'Невозможно опубликовать панель в этом канале.',
         ephemeral: true,
       });
       return;
     }
 
+    const panelSettings = getCachedTicketPanelSettings();
+    const categories = getActiveTicketCategories();
+
+    const panelTitle = panelSettings?.title || '🎫 Поддержка Nordwind Virtual Airlines';
+    const panelDescription = panelSettings?.description || 'Нажмите на кнопку нужной категории, чтобы открыть обращение.';
+    const panelColor = panelSettings?.color || 0x1d4ed8;
+
     const panelEmbed = new EmbedBuilder()
-      .setColor(0x1d4ed8)
-      .setTitle('🎫 Support Tickets')
-      .setDescription(
-        [
-          'Need help? Click the button below and fill the modal form.',
-          'A private ticket channel will be created for you and staff.',
-        ].join('\n')
-      )
-      .addFields(
-        {
-          name: 'How it works',
-          value: [
-            '1) Click **Create Ticket**',
-            '2) Fill subject and issue details',
-            '3) Staff will answer in your private ticket channel',
-          ].join('\n'),
-          inline: false,
-        },
-        {
-          name: 'Categories',
-          value: ticketAllowedCategories.join(', '),
-          inline: false,
-        },
-        {
-          name: 'Languages',
-          value: ticketAllowedLanguages.join(', '),
-          inline: false,
-        },
-        {
-          name: 'Admin Roles',
-          value:
-            getEffectiveAdminRoleIds().length > 0
-              ? getEffectiveAdminRoleIds().map((id) => `<@&${id}>`).join(' ')
-              : 'Not configured',
-          inline: false,
-        }
-      )
+      .setColor(panelColor)
+      .setTitle(panelTitle)
+      .setDescription(panelDescription)
       .setTimestamp(new Date());
 
-    const panelButtons = new ActionRowBuilder().addComponents(
+    const buttonStyleMap = {
+      1: ButtonStyle.Primary,
+      2: ButtonStyle.Secondary,
+      3: ButtonStyle.Success,
+      4: ButtonStyle.Danger,
+    };
+
+    const components = [];
+    const buttons = categories.map((cat) =>
       new ButtonBuilder()
-        .setCustomId(TICKET_OPEN_BUTTON_ID)
-        .setLabel('Create Ticket')
-        .setStyle(ButtonStyle.Primary)
+        .setCustomId(`${TICKET_CATEGORY_BUTTON_PREFIX}${cat.id}`)
+        .setLabel(cat.name)
+        .setStyle(buttonStyleMap[cat.buttonStyle] || ButtonStyle.Primary)
+        .setEmoji(cat.emoji || '🎫')
     );
 
-    await targetChannel.send({ embeds: [panelEmbed], components: [panelButtons] });
+    for (let i = 0; i < buttons.length; i += 5) {
+      components.push(new ActionRowBuilder().addComponents(buttons.slice(i, i + 5)));
+    }
+
+    if (components.length === 0) {
+      await interaction.reply({
+        content: 'Нет активных категорий тикетов. Настройте их в панели администратора.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await targetChannel.send({ embeds: [panelEmbed], components });
     await interaction.reply({
-      content: `Ticket panel posted to <#${targetChannel.id}>.`,
+      content: `Панель тикетов опубликована в <#${targetChannel.id}>.`,
       ephemeral: true,
     });
     return;
