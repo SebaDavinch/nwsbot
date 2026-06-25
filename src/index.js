@@ -336,12 +336,12 @@ const commands = [
     ),
   new SlashCommandBuilder()
     .setName('routes')
-    .setDescription('Show available routes from an ICAO airport')
+    .setDescription('Show available routes from an airport (defaults to your current location)')
     .addStringOption((opt) =>
       opt
         .setName('icao')
-        .setDescription('Departure ICAO (e.g. LTAI)')
-        .setRequired(true)
+        .setDescription('Departure ICAO (e.g. ULLI) — leave empty to use your current location')
+        .setRequired(false)
         .setMinLength(4)
         .setMaxLength(4)
     )
@@ -5938,17 +5938,23 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    const fromIcao = normalizeIcao(interaction.options.getString('icao', true));
-    if (fromIcao.length !== 4) {
-      await interaction.reply({
-        content: 'ICAO must be 4 letters (example: LTAI).',
-        ephemeral: true,
-      });
-      return;
-    }
-
+    const rawIcao = interaction.options.getString('icao') || '';
     const limit = interaction.options.getInteger('limit') ?? 12;
     await interaction.deferReply();
+
+    let fromIcao = normalizeIcao(rawIcao);
+
+    if (!fromIcao || fromIcao.length !== 4) {
+      const profile = await getPilotProfileData(interaction.user.id).catch(() => null);
+      const locationCode = toAirportCode(profile?.airportCode) || null;
+      if (!locationCode || locationCode.length !== 4) {
+        await interaction.editReply(
+          'Не указан ICAO и локация пилота не задана. Используй `/routes ULLI` или сначала обнови локацию через `/location`.'
+        );
+        return;
+      }
+      fromIcao = locationCode;
+    }
 
     try {
       const [lookup, routes] = await Promise.all([loadAirportsLookup(), loadRoutesList()]);
