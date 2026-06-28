@@ -66,7 +66,7 @@ const vamsysApiScope = String(
 const liveFeedChannelId =
   process.env.LIVE_FEED_CHANNEL_ID || '1456988328388985003';
 const liveFeedIntervalMs = Number(process.env.LIVE_FEED_INTERVAL_MS || 120000);
-const caucasusWebBaseUrl = String(process.env.CAUCASUS_WEB_URL || 'https://vatcaucasus.com')
+const caucasusWebBaseUrl = String(process.env.CAUCASUS_WEB_URL || 'https://caucasus-acc.ru')
   .trim()
   .replace(/\/+$/, '');
 const caucasusFeedChannelId = String(process.env.CAUCASUS_FEED_CHANNEL_ID || '').trim();
@@ -3634,7 +3634,7 @@ function buildCaucasusAtcEmbed(liveData, bookings) {
     });
   }
 
-  embed.setFooter({ text: `Updated · vatcaucasus.com` });
+  embed.setFooter({ text: `Updated · caucasus-acc.ru` });
   return embed;
 }
 
